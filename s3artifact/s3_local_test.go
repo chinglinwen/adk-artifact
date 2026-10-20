@@ -16,6 +16,7 @@ package s3artifact
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/chinglinwen/adk-artifact/tests"
-	"google.golang.org/adk/artifact"
+	"google.golang.org/adk/v2/artifact"
 )
 
 func TestLocalS3ArtifactService(t *testing.T) {
@@ -36,6 +37,13 @@ func TestLocalS3ArtifactService(t *testing.T) {
 	secretKey := "secret"
 	bucketName := "test-bucket"
 	ctx := context.Background()
+
+	// Skip when no local S3-compatible server is listening.
+	if conn, err := net.DialTimeout("tcp", "localhost:8333", 2*time.Second); err != nil {
+		t.Skipf("local S3 server not reachable at localhost:8333: %v", err)
+	} else {
+		conn.Close()
+	}
 
 	// Helper to create the bucket if it doesn't exist
 	setupBucket := func() error {

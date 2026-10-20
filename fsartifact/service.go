@@ -21,9 +21,11 @@ package fsartifact
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,9 +33,14 @@ import (
 	"strconv"
 	"strings"
 
-	"google.golang.org/adk/artifact"
+	"google.golang.org/adk/v2/artifact"
 	"google.golang.org/genai"
 )
+
+// customMetaSuffix is the suffix of the sidecar file holding custom metadata
+// (a JSON object of string values) for an artifact version. It is not a valid
+// version number, so Versions ignores it.
+const customMetaSuffix = ".custom.json"
 
 // fsService is a file system implementation of the Service.
 type fsService struct {
@@ -128,6 +135,25 @@ func (s *fsService) Save(ctx context.Context, req *artifact.SaveRequest) (*artif
 		return nil, fmt.Errorf("failed to write metadata file: %w", err)
 	}
 
+	// Persist caller-defined custom metadata (values stored as strings).
+	// The sidecar file is only written when there is metadata to store.
+	if len(req.CustomMetadata) > 0 {
+		custom := make(map[string]string, len(req.CustomMetadata))
+		for k, v := range req.CustomMetadata {
+			custom[k] = fmt.Sprint(v)
+		}
+		b, err := json.Marshal(custom)
+		if err == nil {
+			err = os.WriteFile(path+customMetaSuffix, b, 0644)
+		}
+		if err != nil {
+			// Best effort cleanup
+			os.Remove(path)
+			os.Remove(metaPath)
+			return nil, fmt.Errorf("failed to write custom metadata file: %w", err)
+		}
+	}
+
 	return &artifact.SaveResponse{Version: nextVersion}, nil
 }
 
@@ -183,8 +209,9 @@ func (s *fsService) Delete(ctx context.Context, req *artifact.DeleteRequest) err
 	if version != 0 {
 		path := s.buildPath(appName, userID, sessionID, fileName, version)
 		err := os.Remove(path)
-		// Clean up meta file as well
+		// Clean up meta files as well
 		os.Remove(path + ".meta")
+		os.Remove(path + customMetaSuffix)
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to delete artifact file: %w", err)
 		}
@@ -271,4 +298,64 @@ func (s *fsService) Versions(ctx context.Context, req *artifact.VersionsRequest)
 
 	sort.Slice(versions, func(i, j int) bool { return versions[i] < versions[j] })
 	return &artifact.VersionsResponse{Versions: versions}, nil
+}
+
+// GetArtifactVersion implements [artifact.Service]
+func (s *fsService) GetArtifactVersion(ctx context.Context, req *artifact.GetArtifactVersionRequest) (*artifact.GetArtifactVersionResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("request validation failed: %w", err)
+	}
+	appName, userID, sessionID, fileName := req.AppName, req.UserID, req.SessionID, req.FileName
+	version := req.Version
+
+	if version == 0 {
+		response, err := s.Versions(ctx, &artifact.VersionsRequest{
+			AppName: req.AppName, UserID: req.UserID, SessionID: req.SessionID, FileName: req.FileName,
+		})
+		if err != nil {
+			return nil, err // artifact not found error comes from Versions
+		}
+		version = slices.Max(response.Versions)
+	}
+
+	path := s.buildPath(appName, userID, sessionID, fileName, version)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("artifact '%s' version %d not found: %w", fileName, version, fs.ErrNotExist)
+		}
+		return nil, fmt.Errorf("could not stat file '%s': %w", path, err)
+	}
+
+	mimeType := "text/plain"
+	if metaData, err := os.ReadFile(path + ".meta"); err == nil {
+		mimeType = string(metaData)
+	}
+
+	customMetadata := map[string]any{}
+	if b, err := os.ReadFile(path + customMetaSuffix); err == nil {
+		var custom map[string]string
+		if err := json.Unmarshal(b, &custom); err != nil {
+			return nil, fmt.Errorf("could not parse custom metadata for '%s': %w", path, err)
+		}
+		for k, v := range custom {
+			customMetadata[k] = v
+		}
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		absPath = path
+	}
+	canonicalURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}).String()
+
+	return &artifact.GetArtifactVersionResponse{
+		ArtifactVersion: &artifact.ArtifactVersion{
+			Version:        version,
+			CanonicalURI:   canonicalURI,
+			CustomMetadata: customMetadata,
+			CreateTime:     info.ModTime(),
+			MimeType:       mimeType,
+		},
+	}, nil
 }

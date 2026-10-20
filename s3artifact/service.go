@@ -38,12 +38,13 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/genai"
 
-	"google.golang.org/adk/artifact"
+	"google.golang.org/adk/v2/artifact"
 )
 
 // s3Service is an S3 implementation of the Service using gocloud.dev/blob.
 type s3Service struct {
-	bucket *blob.Bucket
+	bucket     *blob.Bucket
+	bucketName string
 }
 
 // NewService creates an S3 service for the specified bucket.
@@ -60,7 +61,8 @@ func NewService(ctx context.Context, bucketName string, optFns ...func(*config.L
 	}
 
 	s := &s3Service{
-		bucket: bucket,
+		bucket:     bucket,
+		bucketName: bucketName,
 	}
 	return s, nil
 }
@@ -117,9 +119,19 @@ func (s *s3Service) Save(ctx context.Context, req *artifact.SaveRequest) (_ *art
 
 	key := buildKey(appName, userID, sessionID, fileName, nextVersion)
 
+	// Caller-defined custom metadata is stored as blob metadata (string values).
+	// Note: the blob layer lowercases metadata keys.
+	var customMetadata map[string]string
+	if len(req.CustomMetadata) > 0 {
+		customMetadata = make(map[string]string, len(req.CustomMetadata))
+		for k, v := range req.CustomMetadata {
+			customMetadata[k] = fmt.Sprint(v)
+		}
+	}
+
 	var opts *blob.WriterOptions
 	if newArtifact.InlineData != nil {
-		opts = &blob.WriterOptions{ContentType: newArtifact.InlineData.MIMEType}
+		opts = &blob.WriterOptions{ContentType: newArtifact.InlineData.MIMEType, Metadata: customMetadata}
 		w, err := s.bucket.NewWriter(ctx, key, opts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create writer: %w", err)
@@ -132,7 +144,7 @@ func (s *s3Service) Save(ctx context.Context, req *artifact.SaveRequest) (_ *art
 			return nil, fmt.Errorf("failed to close writer: %w", err)
 		}
 	} else {
-		opts = &blob.WriterOptions{ContentType: "text/plain"}
+		opts = &blob.WriterOptions{ContentType: "text/plain", Metadata: customMetadata}
 		w, err := s.bucket.NewWriter(ctx, key, opts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create writer: %w", err)
@@ -353,6 +365,53 @@ func (s *s3Service) Versions(ctx context.Context, req *artifact.VersionsRequest)
 		return nil, fmt.Errorf("artifact not found: %w", fs.ErrNotExist)
 	}
 	return response, nil
+}
+
+// GetArtifactVersion implements [artifact.Service]
+func (s *s3Service) GetArtifactVersion(ctx context.Context, req *artifact.GetArtifactVersionRequest) (*artifact.GetArtifactVersionResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("request validation failed: %w", err)
+	}
+	appName, userID, sessionID, fileName := req.AppName, req.UserID, req.SessionID, req.FileName
+	version := req.Version
+
+	if version == 0 {
+		response, err := s.Versions(ctx, &artifact.VersionsRequest{
+			AppName: req.AppName, UserID: req.UserID, SessionID: req.SessionID, FileName: req.FileName,
+		})
+		if err != nil {
+			return nil, err // artifact not found error comes from Versions
+		}
+		version = slices.Max(response.Versions)
+	}
+
+	key := buildKey(appName, userID, sessionID, fileName, version)
+	attrs, err := s.bucket.Attributes(ctx, key)
+	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return nil, fmt.Errorf("artifact '%s' not found: %w", key, fs.ErrNotExist)
+		}
+		return nil, fmt.Errorf("could not get attributes of object '%s': %w", key, err)
+	}
+
+	customMetadata := make(map[string]any, len(attrs.Metadata))
+	for k, v := range attrs.Metadata {
+		customMetadata[k] = v
+	}
+	createTime := attrs.CreateTime
+	if createTime.IsZero() {
+		createTime = attrs.ModTime
+	}
+
+	return &artifact.GetArtifactVersionResponse{
+		ArtifactVersion: &artifact.ArtifactVersion{
+			Version:        version,
+			CanonicalURI:   fmt.Sprintf("s3://%s/%s", s.bucketName, key),
+			CustomMetadata: customMetadata,
+			CreateTime:     createTime,
+			MimeType:       attrs.ContentType,
+		},
+	}, nil
 }
 
 // Close closes the bucket connection

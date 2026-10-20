@@ -19,7 +19,7 @@ import (
 
 	"github.com/chinglinwen/adk-artifact/fsartifact"
 	"github.com/chinglinwen/adk-artifact/tests"
-	"google.golang.org/adk/artifact"
+	"google.golang.org/adk/v2/artifact"
 )
 
 func TestFSArtifactService(t *testing.T) {

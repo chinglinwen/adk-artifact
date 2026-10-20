@@ -1,5 +1,15 @@
 # adk-artifact
 
+Artifact services (`fsartifact`, `s3artifact`) implementing `artifact.Service` from
+[`google.golang.org/adk/v2`](https://github.com/google/adk-go) (tested with v2.6.0, requires Go 1.26.6+).
+
+```go
+import "google.golang.org/adk/v2/artifact"
+```
+
+The examples below also use ADK v2 packages, e.g. `google.golang.org/adk/v2/session/database`
+and `google.golang.org/adk/v2/model/gemini`.
+
 ## fs artifact
 
 ```go

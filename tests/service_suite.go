@@ -25,7 +25,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/genai"
 
-	"google.golang.org/adk/artifact"
+	"google.golang.org/adk/v2/artifact"
 )
 
 func TestArtifactService(t *testing.T, name string, factory func(t *testing.T) (artifact.Service, error)) {
@@ -55,6 +55,65 @@ func TestArtifactService(t *testing.T, name string, factory func(t *testing.T) (
 			t.Fatalf("Failed to set up service: %v", err)
 		}
 		testArtifactService_UserScoped(ctx, t, srv, name)
+	})
+	t.Run(fmt.Sprintf("Test%sArtifactService_GetArtifactVersion", name), func(t *testing.T) {
+		ctx := t.Context()
+		srv, err := factory(t)
+		if err != nil {
+			t.Fatalf("Failed to set up service: %v", err)
+		}
+		testArtifactService_GetArtifactVersion(ctx, t, srv)
+	})
+}
+
+func testArtifactService_GetArtifactVersion(ctx context.Context, t *testing.T, srv artifact.Service) {
+	appName, userID, sessionID, fileName := "metaapp", "metauser", "metasession", "metafile"
+	for i, md := range []map[string]any{nil, {"owner": "alice", "count": 3}} {
+		if _, err := srv.Save(ctx, &artifact.SaveRequest{
+			AppName: appName, UserID: userID, SessionID: sessionID, FileName: fileName,
+			Part:           genai.NewPartFromBytes([]byte(fmt.Sprintf("v%d", i+1)), "text/plain"),
+			CustomMetadata: md,
+		}); err != nil {
+			t.Fatalf("Save(v%d) failed: %v", i+1, err)
+		}
+	}
+
+	get := func(version int64) (*artifact.ArtifactVersion, error) {
+		resp, err := srv.GetArtifactVersion(ctx, &artifact.GetArtifactVersionRequest{
+			AppName: appName, UserID: userID, SessionID: sessionID, FileName: fileName, Version: version,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return resp.ArtifactVersion, nil
+	}
+
+	t.Run("latest", func(t *testing.T) {
+		av, err := get(0)
+		if err != nil {
+			t.Fatalf("GetArtifactVersion(latest) failed: %v", err)
+		}
+		if av.Version != 2 || av.MimeType != "text/plain" || av.CanonicalURI == "" || av.CreateTime.IsZero() {
+			t.Errorf("GetArtifactVersion(latest) = %+v, want version 2, mime text/plain, non-empty URI and create time", av)
+		}
+		want := map[string]any{"owner": "alice", "count": "3"}
+		if diff := cmp.Diff(want, av.CustomMetadata); diff != "" {
+			t.Errorf("CustomMetadata mismatch (-want +got):\n%s", diff)
+		}
+	})
+	t.Run("version1_no_metadata", func(t *testing.T) {
+		av, err := get(1)
+		if err != nil {
+			t.Fatalf("GetArtifactVersion(1) failed: %v", err)
+		}
+		if av.Version != 1 || av.CustomMetadata == nil || len(av.CustomMetadata) != 0 {
+			t.Errorf("GetArtifactVersion(1) = %+v, want version 1 and empty non-nil CustomMetadata", av)
+		}
+	})
+	t.Run("not_found", func(t *testing.T) {
+		if _, err := get(99); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("GetArtifactVersion(99) error = %v, want %v", err, fs.ErrNotExist)
+		}
 	})
 }
 
